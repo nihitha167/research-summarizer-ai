@@ -1,14 +1,19 @@
 version: 1
+env:
+  variables:
+    NODE_OPTIONS: "--max_old_space_size=4096"
+
 frontend:
   phases:
     preBuild:
       commands:
         - cd frontend
-        - nvm use 18 || true
-        - npm install
+        - corepack enable
+        - corepack prepare yarn@stable --activate
+        - yarn install
     build:
       commands:
-        - npm run build
+        - yarn build
   artifacts:
     baseDirectory: frontend/dist
     files:
@@ -16,3 +21,8 @@ frontend:
   cache:
     paths:
       - frontend/node_modules/**/*
+
+backend:
+  phases:
+    build:
+      commands: []
