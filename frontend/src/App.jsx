@@ -14,7 +14,7 @@ function App() {
           </header>
 
           <main className="app-main">
-            <h2>Welcome, {user?.username}</h2>
+            <h2>Welcome, {user?.attributes?.email}</h2>
             <p>Your Cognito sub ID: {user?.attributes?.sub}</p>
           </main>
 
