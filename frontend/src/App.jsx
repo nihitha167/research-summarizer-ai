@@ -13,10 +13,17 @@ function App() {
             <button onClick={signOut}>Sign Out</button>
           </header>
 
-          <main className="app-main">
-            <h2>Welcome, {user?.attributes?.email}</h2>
-            <p>Your Cognito sub ID: {user?.attributes?.sub}</p>
-          </main>
+         <main className="app-main">
+          <h2>
+            Welcome,{" "}
+            {user?.signInDetails?.loginId ?? user?.username}
+          </h2>
+          <p>
+            Your Cognito user ID:{" "}
+            {user?.userId ?? user?.username}
+          </p>
+      </main>
+
 
           <footer className="app-footer">
             <small>Built with react & AWS</small>
