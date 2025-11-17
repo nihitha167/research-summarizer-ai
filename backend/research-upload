@@ -1,0 +1,281 @@
+/**
+ * ============================================================================
+ * Lambda Function: research-upload
+ * ============================================================================
+ * 
+ * PURPOSE:
+ * Generates a pre-signed S3 URL for secure file uploads from the frontend.
+ * This allows the frontend to upload files directly to S3 without passing
+ * through the Lambda, which is more efficient and cost-effective.
+ * 
+ * ============================================================================
+ * AWS SETUP PREREQUISITES (Do these BEFORE deploying this Lambda):
+ * ============================================================================
+ * 
+ * 1. CREATE S3 BUCKET:
+ *    - Go to S3 Console → Create bucket
+ *    - Name: research-summarizer-uploads-[your-unique-suffix]
+ *    - Region: us-east-1 (or your preferred region)
+ *    - Block all public access: YES (keep it secure)
+ *    - Enable versioning: Optional
+ *    - Create bucket
+ * 
+ * 2. CREATE DYNAMODB TABLE:
+ *    - Go to DynamoDB Console → Create table
+ *    - Table name: ResearchSummaries
+ *    - Partition key: userId (String)
+ *    - Sort key: createdAt (String)
+ *    - Settings: Use default settings (on-demand billing recommended)
+ *    - Create table
+ * 
+ * 3. CREATE COGNITO USER POOL (if not already created):
+ *    - Go to Cognito Console → Create user pool
+ *    - Configure sign-in options (email recommended)
+ *    - Configure security requirements
+ *    - Configure sign-up experience
+ *    - Configure message delivery
+ *    - Create user pool
+ *    - Note down the User Pool ID and Client ID
+ * 
+ * 4. CREATE API GATEWAY HTTP API:
+ *    - Go to API Gateway Console → Create API → HTTP API
+ *    - API name: research-summarizer-api
+ *    - Create
+ * 
+ * 5. CREATE JWT AUTHORIZER:
+ *    - In API Gateway → Your API → Authorization
+ *    - Create authorizer
+ *    - Name: CognitoJWT
+ *    - Type: JWT
+ *    - Issuer URL: https://cognito-idp.[region].amazonaws.com/[UserPoolId]
+ *    - Audience: [Your Cognito App Client ID]
+ *    - Create
+ * 
+ * ============================================================================
+ * LAMBDA DEPLOYMENT STEPS:
+ * ============================================================================
+ * 
+ * 1. CREATE LAMBDA FUNCTION:
+ *    - Go to Lambda Console → Create function
+ *    - Function name: research-upload
+ *    - Runtime: Node.js 20.x
+ *    - Architecture: x86_64
+ *    - Execution role: Create new role with basic Lambda permissions
+ *    - Create function
+ * 
+ * 2. ADD S3 PERMISSIONS TO LAMBDA ROLE:
+ *    - Go to Configuration → Permissions
+ *    - Click on the execution role name
+ *    - Add permissions → Create inline policy
+ *    - JSON editor:
+ *      {
+ *        "Version": "2012-10-17",
+ *        "Statement": [
+ *          {
+ *            "Effect": "Allow",
+ *            "Action": [
+ *              "s3:PutObject",
+ *              "s3:PutObjectAcl"
+ *            ],
+ *            "Resource": "arn:aws:s3:::your-bucket-name/*"
+ *          }
+ *        ]
+ *      }
+ *    - Name the policy: S3UploadPolicy
+ *    - Create policy
+ * 
+ * 3. SET ENVIRONMENT VARIABLES:
+ *    - Go to Configuration → Environment variables
+ *    - Add environment variable:
+ *      Key: UPLOAD_BUCKET
+ *      Value: your-bucket-name (the S3 bucket you created)
+ *    - Save
+ * 
+ * 4. DEPLOY CODE:
+ *    - Copy this code into the Lambda function editor
+ *    - Click "Deploy"
+ * 
+ * 5. CREATE API GATEWAY ROUTE:
+ *    - Go to API Gateway → Your API → Routes → Create
+ *    - Method: POST
+ *    - Path: /upload
+ *    - Create
+ * 
+ * 6. ATTACH INTEGRATION:
+ *    - Click on POST /upload route
+ *    - Click "Attach integration"
+ *    - Integration type: Lambda function
+ *    - Lambda function: research-upload
+ *    - Payload format version: 2.0
+ *    - Create
+ * 
+ * 7. ADD AUTHORIZATION:
+ *    - In the route details, click "Configure" under Authorization
+ *    - Select your JWT authorizer
+ *    - Save
+ * 
+ * 8. ENABLE CORS:
+ *    - Go to API Gateway → Your API → CORS
+ *    - Configure:
+ *      - Access-Control-Allow-Origin: * (or your specific domain)
+ *      - Access-Control-Allow-Methods: POST, GET, DELETE, OPTIONS
+ *      - Access-Control-Allow-Headers: content-type, authorization
+ *    - Save
+ * 
+ * 9. DEPLOY API:
+ *    - Click "Deploy" button (orange button at top)
+ *    - Your API is now live!
+ * 
+ * ============================================================================
+ * CODE EXPLANATION:
+ * ============================================================================
+ */
+
+// Import AWS SDK v3 clients for S3 operations
+const { S3Client } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+const { PutObjectCommand } = require("@aws-sdk/client-s3");
+
+// Initialize S3 client (uses IAM role credentials automatically)
+const s3Client = new S3Client({});
+
+/**
+ * Main Lambda handler function
+ * This function is invoked when a POST request hits /upload endpoint
+ * 
+ * @param {Object} event - API Gateway event object containing request details
+ * @returns {Object} Response with pre-signed URL for S3 upload
+ */
+exports.handler = async (event) => {
+  try {
+    // Log incoming request for debugging
+    console.log("Incoming event:", JSON.stringify(event));
+
+    // ========================================================================
+    // STEP 1: Extract user identity from JWT token
+    // ========================================================================
+    // API Gateway automatically validates the JWT and extracts claims
+    // The claims contain user information from Cognito
+    const claims = event.requestContext?.authorizer?.jwt?.claims || {};
+    const userId = claims.sub || "anonymous"; // 'sub' is the unique user ID
+    
+    // ========================================================================
+    // STEP 2: Parse request body to get file information
+    // ========================================================================
+    // Frontend sends: { fileName: "document.pdf", contentType: "application/pdf" }
+    const body = JSON.parse(event.body || "{}");
+    const { fileName, contentType } = body;
+
+    // Validate that fileName is provided
+    if (!fileName) {
+      return {
+        statusCode: 400,
+        headers: { "Access-Control-Allow-Origin": "*" },
+        body: JSON.stringify({ error: "fileName is required" }),
+      };
+    }
+
+    // ========================================================================
+    // STEP 3: Get S3 bucket name from environment variable
+    // ========================================================================
+    const bucketName = process.env.UPLOAD_BUCKET;
+    if (!bucketName) {
+      throw new Error("UPLOAD_BUCKET env var is not set");
+    }
+
+    // ========================================================================
+    // STEP 4: Generate unique S3 key for the file
+    // ========================================================================
+    // Structure: private/{userId}/{timestamp}-{sanitizedFileName}
+    // This ensures:
+    // - Each user has their own folder (private/{userId})
+    // - Files are uniquely named with timestamp
+    // - File names are safe (no special characters)
+    const timestamp = Date.now();
+    const safeName = fileName.replace(/[^a-zA-Z0-9.\-_]/g, "_");
+    const fileKey = `private/${userId}/${timestamp}-${safeName}`;
+
+    // ========================================================================
+    // STEP 5: Create S3 PutObject command
+    // ========================================================================
+    // This command defines what operation the pre-signed URL will allow
+    const command = new PutObjectCommand({
+      Bucket: bucketName,
+      Key: fileKey,
+      ContentType: contentType || "application/octet-stream",
+    });
+
+    // ========================================================================
+    // STEP 6: Generate pre-signed URL
+    // ========================================================================
+    // This URL allows the frontend to upload directly to S3
+    // The URL expires in 5 minutes (300 seconds) for security
+    const uploadUrl = await getSignedUrl(s3Client, command, { expiresIn: 300 });
+
+    // ========================================================================
+    // STEP 7: Return response to frontend
+    // ========================================================================
+    // Frontend will:
+    // 1. Use uploadUrl to PUT the file to S3
+    // 2. Use fileKey to reference the file in /summarize endpoint
+    return {
+      statusCode: 200,
+      headers: { "Access-Control-Allow-Origin": "*" },
+      body: JSON.stringify({
+        uploadUrl,    // URL for direct S3 upload
+        fileKey,      // S3 key to reference the file later
+        bucket: bucketName,
+      }),
+    };
+
+  } catch (err) {
+    // Log and return error
+    console.error("Error in upload lambda:", err);
+    return {
+      statusCode: 500,
+      headers: { "Access-Control-Allow-Origin": "*" },
+      body: JSON.stringify({ error: err.message }),
+    };
+  }
+};
+
+/**
+ * ============================================================================
+ * TESTING THE LAMBDA:
+ * ============================================================================
+ * 
+ * 1. TEST IN LAMBDA CONSOLE:
+ *    - Go to Lambda function → Test tab
+ *    - Create new test event:
+ *      {
+ *        "body": "{\"fileName\":\"test.pdf\",\"contentType\":\"application/pdf\"}",
+ *        "requestContext": {
+ *          "authorizer": {
+ *            "jwt": {
+ *              "claims": {
+ *                "sub": "test-user-123",
+ *                "email": "test@example.com"
+ *              }
+ *            }
+ *          }
+ *        }
+ *      }
+ *    - Run test
+ *    - Should return 200 with uploadUrl and fileKey
+ * 
+ * 2. TEST FROM FRONTEND:
+ *    - Make sure your frontend is configured with the correct API URL
+ *    - Try uploading a file through the UI
+ *    - Check CloudWatch Logs for any errors
+ * 
+ * ============================================================================
+ * TROUBLESHOOTING:
+ * ============================================================================
+ * 
+ * - "UPLOAD_BUCKET not set": Add environment variable in Lambda configuration
+ * - "Access Denied" to S3: Check Lambda execution role has S3 permissions
+ * - "CORS error": Configure CORS in API Gateway
+ * - "401 Unauthorized": Check JWT authorizer configuration
+ * 
+ * ============================================================================
+ */

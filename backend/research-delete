@@ -1,0 +1,369 @@
+/**
+ * ============================================================================
+ * Lambda Function: research-delete
+ * ============================================================================
+ * 
+ * PURPOSE:
+ * Deletes a document and its summary from both DynamoDB and S3.
+ * Ensures users can only delete their own documents.
+ * 
+ * ============================================================================
+ * AWS SETUP PREREQUISITES:
+ * ============================================================================
+ * 
+ * - S3 bucket and DynamoDB table should already exist
+ * - S3 bucket: research-summarizer-uploads-xxx
+ * - DynamoDB table: ResearchSummaries
+ * 
+ * ============================================================================
+ * LAMBDA DEPLOYMENT STEPS:
+ * ============================================================================
+ * 
+ * 1. CREATE LAMBDA FUNCTION:
+ *    - Function name: research-delete
+ *    - Runtime: Node.js 20.x
+ *    - Architecture: x86_64
+ *    - Memory: 256 MB
+ *    - Timeout: 30 seconds
+ *    - Create function
+ * 
+ * 2. ADD IAM PERMISSIONS:
+ *    - Go to Configuration → Permissions → Execution role
+ *    - Add inline policy:
+ *      {
+ *        "Version": "2012-10-17",
+ *        "Statement": [
+ *          {
+ *            "Effect": "Allow",
+ *            "Action": [
+ *              "dynamodb:Query",
+ *              "dynamodb:DeleteItem"
+ *            ],
+ *            "Resource": "arn:aws:dynamodb:us-east-1:*:table/ResearchSummaries"
+ *          },
+ *          {
+ *            "Effect": "Allow",
+ *            "Action": [
+ *              "s3:DeleteObject"
+ *            ],
+ *            "Resource": "arn:aws:s3:::your-bucket-name/*"
+ *          }
+ *        ]
+ *      }
+ * 
+ * 3. SET ENVIRONMENT VARIABLES:
+ *    - HISTORY_TABLE: ResearchSummaries
+ *    - UPLOAD_BUCKET: your-s3-bucket-name
+ * 
+ * 4. DEPLOY CODE:
+ *    - Change file to .mjs (ES Module)
+ *    - Copy this code
+ *    - Deploy
+ * 
+ * 5. CREATE API GATEWAY ROUTE:
+ *    - Method: POST
+ *    - Path: /delete-item
+ *    - Integration: Lambda function (research-delete)
+ *    - Authorization: JWT authorizer
+ *    - Deploy API
+ * 
+ * ============================================================================
+ * WHY POST INSTEAD OF DELETE?
+ * ============================================================================
+ * 
+ * We use POST /delete-item instead of DELETE /item/{fileKey} because:
+ * 1. File keys contain forward slashes (private/userId/file.pdf)
+ * 2. URL encoding these causes issues even with greedy path params
+ * 3. POST with body is more reliable and simpler to implement
+ * 4. Still secure because JWT authorizer validates the user
+ * 
+ * ============================================================================
+ * CODE EXPLANATION:
+ * ============================================================================
+ */
+
+// Import AWS SDK v3 clients
+import {
+  DynamoDBClient,
+  QueryCommand,
+  DeleteItemCommand,
+} from "@aws-sdk/client-dynamodb";
+import { unmarshall } from "@aws-sdk/util-dynamodb";
+import { S3Client, DeleteObjectCommand } from "@aws-sdk/client-s3";
+
+// Initialize AWS service clients
+const ddb = new DynamoDBClient({});
+const s3 = new S3Client({});
+
+/**
+ * Main Lambda handler
+ * Deletes item from both DynamoDB and S3
+ * 
+ * @param {Object} event - API Gateway event object
+ * @returns {Object} Success or error response
+ */
+export const handler = async (event) => {
+  console.log("=== DELETE ITEM REQUEST ===");
+  console.log("Event:", JSON.stringify(event, null, 2));
+
+  try {
+    // ========================================================================
+    // STEP 1: Get user ID from JWT token
+    // ========================================================================
+    const claims = event.requestContext?.authorizer?.jwt?.claims || {};
+    const userId = claims.sub;
+    console.log("User ID:", userId);
+
+    if (!userId) {
+      console.error("No userId found in JWT claims");
+      return {
+        statusCode: 401,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ message: "Unauthorized" }),
+      };
+    }
+
+    // ========================================================================
+    // STEP 2: Get environment variables
+    // ========================================================================
+    const HISTORY_TABLE = process.env.HISTORY_TABLE;
+    const UPLOAD_BUCKET = process.env.UPLOAD_BUCKET;
+    console.log("History Table:", HISTORY_TABLE);
+    console.log("Upload Bucket:", UPLOAD_BUCKET);
+
+    if (!HISTORY_TABLE || !UPLOAD_BUCKET) {
+      throw new Error("Missing environment variables");
+    }
+
+    // ========================================================================
+    // STEP 3: Parse request body to get fileKey
+    // ========================================================================
+    let body;
+    try {
+      body = JSON.parse(event.body || "{}");
+      console.log("Parsed body:", body);
+    } catch (parseError) {
+      console.error("Failed to parse body:", parseError);
+      return {
+        statusCode: 400,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ message: "Invalid request body" }),
+      };
+    }
+
+    const fileKey = body.fileKey;
+    console.log("FileKey to delete:", fileKey);
+
+    if (!fileKey) {
+      return {
+        statusCode: 400,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ message: "Missing fileKey" }),
+      };
+    }
+
+    // ========================================================================
+    // STEP 4: Query DynamoDB to find the item
+    // ========================================================================
+    // We need to query first because:
+    // 1. DynamoDB requires both partition key (userId) AND sort key (createdAt)
+    // 2. Frontend only knows the fileKey
+    // 3. We need to find the createdAt value to delete the item
+    
+    console.log("Querying DynamoDB...");
+    const queryResult = await ddb.send(
+      new QueryCommand({
+        TableName: HISTORY_TABLE,
+        KeyConditionExpression: "userId = :uid",
+        ExpressionAttributeValues: {
+          ":uid": { S: userId },
+        },
+      })
+    );
+
+    console.log("Query returned", queryResult.Items?.length || 0, "items");
+
+    if (!queryResult.Items || queryResult.Items.length === 0) {
+      return {
+        statusCode: 404,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ message: "No items found" }),
+      };
+    }
+
+    // ========================================================================
+    // STEP 5: Find the item with matching fileKey
+    // ========================================================================
+    // Convert DynamoDB format to regular objects
+    const allItems = queryResult.Items.map(item => unmarshall(item));
+    console.log("Looking for fileKey match among:", allItems.map(i => i.fileKey));
+    
+    // Find the item where fileKey matches
+    const matchingItem = allItems.find(item => item.fileKey === fileKey);
+
+    if (!matchingItem) {
+      console.error("No matching item found for fileKey:", fileKey);
+      return {
+        statusCode: 404,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ 
+          message: "Item not found",
+          requestedKey: fileKey
+        }),
+      };
+    }
+
+    // ========================================================================
+    // STEP 6: Extract createdAt (sort key needed for delete)
+    // ========================================================================
+    const createdAt = matchingItem.createdAt;
+    console.log("Found item, createdAt:", createdAt);
+
+    // ========================================================================
+    // STEP 7: Delete from DynamoDB
+    // ========================================================================
+    // DynamoDB delete requires both keys: partition key + sort key
+    console.log("Deleting from DynamoDB...");
+    await ddb.send(
+      new DeleteItemCommand({
+        TableName: HISTORY_TABLE,
+        Key: {
+          userId: { S: userId },      // Partition key
+          createdAt: { S: createdAt }, // Sort key
+        },
+      })
+    );
+    console.log("DynamoDB delete successful");
+
+    // ========================================================================
+    // STEP 8: Delete from S3
+    // ========================================================================
+    // Delete the actual file from S3 storage
+    // This is wrapped in try-catch because:
+    // - File might have already been deleted manually
+    // - S3 deletion is less critical than DynamoDB (user records are more important)
+    try {
+      console.log("Deleting from S3...");
+      await s3.send(
+        new DeleteObjectCommand({
+          Bucket: UPLOAD_BUCKET,
+          Key: fileKey,
+        })
+      );
+      console.log("S3 delete successful");
+    } catch (s3Error) {
+      // Log but don't fail the request if S3 delete fails
+      console.error("S3 delete failed (non-fatal):", s3Error.message);
+    }
+
+    // ========================================================================
+    // STEP 9: Return success response
+    // ========================================================================
+    const response = {
+      statusCode: 200,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        success: true,
+        message: "Item deleted successfully",
+        fileKey: fileKey,
+        createdAt: createdAt
+      }),
+    };
+
+    console.log("Returning success response");
+    return response;
+
+  } catch (error) {
+    console.error("ERROR:", error);
+    console.error("Stack:", error.stack);
+    
+    return {
+      statusCode: 500,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        message: "Internal server error",
+        error: error.message
+      }),
+    };
+  }
+};
+
+/**
+ * ============================================================================
+ * SECURITY CONSIDERATIONS:
+ * ============================================================================
+ * 
+ * 1. USER ISOLATION:
+ *    - Query uses userId from JWT (can't be spoofed)
+ *    - Users can only see and delete their own items
+ * 
+ * 2. JWT VALIDATION:
+ *    - API Gateway validates JWT before reaching Lambda
+ *    - Invalid tokens are rejected at gateway level
+ * 
+ * 3. AUTHORIZATION:
+ *    - Even if someone knows a fileKey, they can't delete it
+ *    - Must match the userId from their authenticated session
+ * 
+ * 4. AUDIT TRAIL:
+ *    - All actions logged to CloudWatch
+ *    - Can track who deleted what and when
+ * 
+ * ============================================================================
+ * TESTING:
+ * ============================================================================
+ * 
+ * Test event:
+ * {
+ *   "body": "{\"fileKey\":\"private/user-123/1234567890-document.pdf\"}",
+ *   "requestContext": {
+ *     "authorizer": {
+ *       "jwt": {
+ *         "claims": {
+ *           "sub": "user-123",
+ *           "email": "test@example.com"
+ *         }
+ *       }
+ *     }
+ *   }
+ * }
+ * 
+ * Expected response (success):
+ * {
+ *   "statusCode": 200,
+ *   "body": "{\"success\":true,\"message\":\"Item deleted successfully\",\"fileKey\":\"...\",\"createdAt\":\"...\"}"
+ * }
+ * 
+ * ============================================================================
+ * TROUBLESHOOTING:
+ * ============================================================================
+ * 
+ * - "Missing environment variables": Set HISTORY_TABLE and UPLOAD_BUCKET
+ * - "Access denied to DynamoDB": Add Query and DeleteItem permissions
+ * - "Access denied to S3": Add DeleteObject permission
+ * - "Item not found": Check fileKey matches exactly what's in DynamoDB
+ * - "Unauthorized": Check JWT authorizer is configured correctly
+ * 
+ * ============================================================================
+ */

@@ -1,0 +1,348 @@
+/**
+ * ============================================================================
+ * Lambda Function: research-summarize
+ * ============================================================================
+ * 
+ * PURPOSE:
+ * Downloads a PDF/text file from S3, sends it to AWS Bedrock (Claude AI) for
+ * summarization, then stores the summary in DynamoDB for the user's history.
+ * 
+ * ============================================================================
+ * AWS SETUP PREREQUISITES:
+ * ============================================================================
+ * 
+ * 1. ENABLE AWS BEDROCK MODEL ACCESS:
+ *    - Go to AWS Bedrock Console → Model access
+ *    - Click "Manage model access"
+ *    - Enable: Anthropic Claude 3 Haiku
+ *    - Submit and wait for approval (usually instant)
+ *    - IMPORTANT: Bedrock must be in us-east-1 or supported region
+ * 
+ * 2. S3 BUCKET AND DYNAMODB TABLE:
+ *    - Should already exist from research-upload setup
+ *    - S3 bucket: research-summarizer-uploads-xxx
+ *    - DynamoDB table: ResearchSummaries
+ * 
+ * ============================================================================
+ * LAMBDA DEPLOYMENT STEPS:
+ * ============================================================================
+ * 
+ * 1. CREATE LAMBDA FUNCTION:
+ *    - Function name: research-summarize
+ *    - Runtime: Node.js 20.x
+ *    - Architecture: x86_64
+ *    - Memory: 512 MB (recommended for processing large PDFs)
+ *    - Timeout: 2 minutes (Bedrock can take time for large documents)
+ *    - Create function
+ * 
+ * 2. ADD IAM PERMISSIONS:
+ *    - Go to Configuration → Permissions → Execution role
+ *    - Add inline policy (JSON):
+ *      {
+ *        "Version": "2012-10-17",
+ *        "Statement": [
+ *          {
+ *            "Effect": "Allow",
+ *            "Action": [
+ *              "s3:GetObject"
+ *            ],
+ *            "Resource": "arn:aws:s3:::your-bucket-name/*"
+ *          },
+ *          {
+ *            "Effect": "Allow",
+ *            "Action": [
+ *              "dynamodb:PutItem"
+ *            ],
+ *            "Resource": "arn:aws:dynamodb:us-east-1:*:table/ResearchSummaries"
+ *          },
+ *          {
+ *            "Effect": "Allow",
+ *            "Action": [
+ *              "bedrock:InvokeModel"
+ *            ],
+ *            "Resource": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
+ *          }
+ *        ]
+ *      }
+ * 
+ * 3. SET ENVIRONMENT VARIABLES:
+ *    - UPLOAD_BUCKET: your-s3-bucket-name
+ *    - HISTORY_TABLE: ResearchSummaries
+ * 
+ * 4. DEPLOY CODE:
+ *    - Change file extension to .mjs (ES Module)
+ *    - Copy this code
+ *    - Deploy
+ * 
+ * 5. CREATE API GATEWAY ROUTE:
+ *    - Method: POST
+ *    - Path: /summarize
+ *    - Integration: Lambda function (research-summarize)
+ *    - Authorization: JWT authorizer
+ *    - Deploy API
+ * 
+ * ============================================================================
+ * CODE EXPLANATION:
+ * ============================================================================
+ */
+
+// Import AWS SDK v3 clients
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { DynamoDBClient, PutItemCommand } from "@aws-sdk/client-dynamodb";
+import {
+  BedrockRuntimeClient,
+  ConverseCommand,
+} from "@aws-sdk/client-bedrock-runtime";
+
+// Initialize AWS service clients
+const s3 = new S3Client({});
+const dynamo = new DynamoDBClient({});
+const bedrock = new BedrockRuntimeClient({ region: "us-east-1" });
+
+/**
+ * Helper function to convert S3 stream to Buffer
+ * S3 returns a readable stream, but Bedrock needs a Buffer
+ * 
+ * @param {ReadableStream} stream - S3 response body stream
+ * @returns {Promise<Buffer>} Complete file data as Buffer
+ */
+const streamToBuffer = async (stream) => {
+  const chunks = [];
+  // Read stream chunk by chunk
+  for await (const chunk of stream) {
+    chunks.push(chunk);
+  }
+  // Combine all chunks into single Buffer
+  return Buffer.concat(chunks);
+};
+
+/**
+ * Main Lambda handler
+ * 
+ * @param {Object} event - API Gateway event
+ * @returns {Object} Response with summary text
+ */
+export const handler = async (event) => {
+  console.log("Incoming event:", JSON.stringify(event));
+
+  try {
+    // ========================================================================
+    // STEP 1: Get user information from JWT
+    // ========================================================================
+    const claims = event.requestContext?.authorizer?.jwt?.claims || {};
+    const userId = claims.sub || "anonymous";
+    const userEmail = claims.email || "unknown@example.com";
+
+    // ========================================================================
+    // STEP 2: Parse request body to get S3 file key
+    // ========================================================================
+    const body = JSON.parse(event.body || "{}");
+    const { fileKey } = body;
+
+    if (!fileKey) {
+      return {
+        statusCode: 400,
+        headers: { "Access-Control-Allow-Origin": "*" },
+        body: JSON.stringify({ error: "fileKey is required" }),
+      };
+    }
+
+    // ========================================================================
+    // STEP 3: Get environment variables
+    // ========================================================================
+    const bucketName = process.env.UPLOAD_BUCKET;
+    const tableName = process.env.HISTORY_TABLE;
+
+    if (!bucketName || !tableName) {
+      throw new Error("UPLOAD_BUCKET or HISTORY_TABLE not set");
+    }
+
+    // ========================================================================
+    // STEP 4: Download file from S3
+    // ========================================================================
+    console.log(`Downloading file from S3: ${fileKey}`);
+    const getCmd = new GetObjectCommand({
+      Bucket: bucketName,
+      Key: fileKey,
+    });
+    const s3Resp = await s3.send(getCmd);
+    const fileBuffer = await streamToBuffer(s3Resp.Body);
+    console.log(`Downloaded ${fileBuffer.length} bytes`);
+
+    // ========================================================================
+    // STEP 5: Determine file format (PDF or TXT)
+    // ========================================================================
+    let format = "pdf";
+    if (fileKey.toLowerCase().endsWith(".txt")) {
+      format = "txt";
+    }
+
+    // ========================================================================
+    // STEP 6: Sanitize filename for Bedrock
+    // ========================================================================
+    // IMPORTANT: Bedrock document name cannot contain periods (except extension)
+    // Extract filename from S3 key
+    const rawFileName = fileKey.split('/').pop() || "document";
+    
+    // Remove file extension
+    const lastDotIndex = rawFileName.lastIndexOf('.');
+    const nameWithoutExt = lastDotIndex > 0 
+      ? rawFileName.substring(0, lastDotIndex) 
+      : rawFileName;
+    
+    // Remove all special characters including periods
+    const sanitizedFileName = nameWithoutExt
+      .replace(/[^a-zA-Z0-9\s\-\(\)\[\]]/g, '-')
+      .replace(/\s+/g, ' ')
+      .replace(/-+/g, '-')
+      .trim() || "research-document";
+
+    console.log("Original filename:", rawFileName);
+    console.log("Sanitized filename:", sanitizedFileName);
+
+    // ========================================================================
+    // STEP 7: Call AWS Bedrock (Claude AI) for summarization
+    // ========================================================================
+    console.log("Sending to Bedrock for summarization...");
+    
+    const converseCmd = new ConverseCommand({
+      // Claude 3 Haiku model - fast and cost-effective
+      modelId: "anthropic.claude-3-haiku-20240307-v1:0",
+      
+      // System prompt - sets the AI's behavior
+      system: [
+        {
+          text: "You are a helpful research assistant. Produce clear, human-readable summaries.",
+        },
+      ],
+      
+      // User message with document and instructions
+      messages: [
+        {
+          role: "user",
+          content: [
+            // Document attachment
+            {
+              document: {
+                format: format,  // "pdf" or "txt"
+                name: sanitizedFileName,  // Name without extension
+                source: {
+                  bytes: fileBuffer,  // File content as bytes
+                },
+              },
+            },
+            // Text instructions
+            {
+              text: `Read the attached document and write a clear, human-readable summary in 5–7 bullet points.
+
+Each bullet should:
+- Use simple language
+- Focus on the main ideas, key concepts, and important results
+- Be helpful to a student who is skimming the paper.
+
+Do NOT describe PDF internals or binary content. Only talk about the actual research content.`,
+            },
+          ],
+        },
+      ],
+      
+      // Model parameters
+      inferenceConfig: {
+        maxTokens: 800,      // Maximum response length
+        temperature: 0.3,    // Lower = more focused, higher = more creative
+      },
+    });
+
+    const bedrockResp = await bedrock.send(converseCmd);
+    console.log("Bedrock response received");
+
+    // ========================================================================
+    // STEP 8: Extract summary text from Bedrock response
+    // ========================================================================
+    const contentBlocks = bedrockResp.output?.message?.content ?? [];
+    const summaryText = contentBlocks
+      .filter((b) => b.text)
+      .map((b) => b.text)
+      .join("\n")
+      .trim();
+
+    if (!summaryText) {
+      throw new Error("No summary returned from Bedrock");
+    }
+
+    console.log("Summary generated:", summaryText.substring(0, 100) + "...");
+
+    // ========================================================================
+    // STEP 9: Store summary in DynamoDB
+    // ========================================================================
+    const createdAt = new Date().toISOString();
+
+    await dynamo.send(
+      new PutItemCommand({
+        TableName: tableName,
+        Item: {
+          userId: { S: userId },              // Partition key
+          createdAt: { S: createdAt },        // Sort key (timestamp)
+          email: { S: userEmail },            // User's email
+          fileKey: { S: fileKey },            // S3 file reference
+          summary: { S: summaryText.slice(0, 4000) },  // Summary (max 4KB)
+        },
+      })
+    );
+
+    console.log("Summary saved to DynamoDB");
+
+    // ========================================================================
+    // STEP 10: Return response to frontend
+    // ========================================================================
+    return {
+      statusCode: 200,
+      headers: { "Access-Control-Allow-Origin": "*" },
+      body: JSON.stringify({
+        summary: summaryText,
+        createdAt,
+      }),
+    };
+
+  } catch (err) {
+    console.error("Error in summarize lambda:", err);
+    return {
+      statusCode: 500,
+      headers: { "Access-Control-Allow-Origin": "*" },
+      body: JSON.stringify({ error: err.message }),
+    };
+  }
+};
+
+/**
+ * ============================================================================
+ * TESTING:
+ * ============================================================================
+ * 
+ * Test event:
+ * {
+ *   "body": "{\"fileKey\":\"private/user-123/1234567890-test.pdf\"}",
+ *   "requestContext": {
+ *     "authorizer": {
+ *       "jwt": {
+ *         "claims": {
+ *           "sub": "user-123",
+ *           "email": "test@example.com"
+ *         }
+ *       }
+ *     }
+ *   }
+ * }
+ * 
+ * ============================================================================
+ * TROUBLESHOOTING:
+ * ============================================================================
+ * 
+ * - "Bedrock access denied": Enable model access in Bedrock console
+ * - "S3 access denied": Check Lambda role has s3:GetObject permission
+ * - "DynamoDB access denied": Check Lambda role has dynamodb:PutItem
+ * - "Timeout": Increase Lambda timeout to 2-3 minutes
+ * - "Out of memory": Increase Lambda memory to 512MB or 1024MB
+ * 
+ * ============================================================================
+ */

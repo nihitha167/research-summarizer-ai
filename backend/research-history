@@ -1,0 +1,286 @@
+/**
+ * ============================================================================
+ * Lambda Function: research-history
+ * ============================================================================
+ * 
+ * PURPOSE:
+ * Retrieves a user's document summary history from DynamoDB.
+ * Returns a list of all documents they've uploaded and summarized,
+ * sorted by most recent first.
+ * 
+ * ============================================================================
+ * AWS SETUP PREREQUISITES:
+ * ============================================================================
+ * 
+ * - DynamoDB table should already exist from previous setup
+ * - Table name: ResearchSummaries
+ * - Partition key: userId (String)
+ * - Sort key: createdAt (String)
+ * 
+ * ============================================================================
+ * LAMBDA DEPLOYMENT STEPS:
+ * ============================================================================
+ * 
+ * 1. CREATE LAMBDA FUNCTION:
+ *    - Function name: research-history
+ *    - Runtime: Node.js 20.x
+ *    - Architecture: x86_64
+ *    - Memory: 256 MB (sufficient for query operations)
+ *    - Timeout: 30 seconds
+ *    - Create function
+ * 
+ * 2. ADD IAM PERMISSIONS:
+ *    - Go to Configuration → Permissions → Execution role
+ *    - Add inline policy:
+ *      {
+ *        "Version": "2012-10-17",
+ *        "Statement": [
+ *          {
+ *            "Effect": "Allow",
+ *            "Action": [
+ *              "dynamodb:Query"
+ *            ],
+ *            "Resource": "arn:aws:dynamodb:us-east-1:*:table/ResearchSummaries"
+ *          }
+ *        ]
+ *      }
+ * 
+ * 3. SET ENVIRONMENT VARIABLES:
+ *    - HISTORY_TABLE: ResearchSummaries
+ * 
+ * 4. DEPLOY CODE:
+ *    - Change file to .mjs (ES Module)
+ *    - Copy this code
+ *    - Deploy
+ * 
+ * 5. CREATE API GATEWAY ROUTE:
+ *    - Method: GET
+ *    - Path: /history
+ *    - Integration: Lambda function (research-history)
+ *    - Authorization: JWT authorizer
+ *    - Deploy API
+ * 
+ * ============================================================================
+ * CODE EXPLANATION:
+ * ============================================================================
+ */
+
+// Import AWS SDK v3 clients for DynamoDB
+import { DynamoDBClient, QueryCommand } from "@aws-sdk/client-dynamodb";
+import { unmarshall } from "@aws-sdk/util-dynamodb";
+
+// Initialize DynamoDB client
+const ddb = new DynamoDBClient({});
+
+/**
+ * Main Lambda handler
+ * Queries DynamoDB for all items belonging to the authenticated user
+ * 
+ * @param {Object} event - API Gateway event object
+ * @returns {Object} Response with array of history items
+ */
+export const handler = async (event) => {
+  console.log("Incoming event:", JSON.stringify(event));
+  
+  try {
+    // ========================================================================
+    // STEP 1: Get user ID from JWT token
+    // ========================================================================
+    const claims = event.requestContext?.authorizer?.jwt?.claims || {};
+    const userId = claims.sub;
+    
+    console.log("UserId from JWT:", userId);
+    
+    // Validate user is authenticated
+    if (!userId) {
+      return {
+        statusCode: 401,
+        headers: { "Access-Control-Allow-Origin": "*" },
+        body: JSON.stringify({ 
+          message: "Unauthorized: missing userId (sub) in JWT claims" 
+        }),
+      };
+    }
+    
+    // ========================================================================
+    // STEP 2: Get DynamoDB table name from environment
+    // ========================================================================
+    const HISTORY_TABLE = process.env.HISTORY_TABLE;
+    
+    console.log("HISTORY_TABLE:", HISTORY_TABLE);
+    
+    if (!HISTORY_TABLE) {
+      throw new Error("HISTORY_TABLE environment variable is not set");
+    }
+    
+    // ========================================================================
+    // STEP 3: Parse optional limit parameter from query string
+    // ========================================================================
+    // Frontend can request specific number of items: GET /history?limit=20
+    const limitParam = event.queryStringParameters?.limit;
+    const limit = limitParam ? parseInt(limitParam, 10) : 20;
+    
+    console.log("Querying DynamoDB with limit:", limit);
+    
+    // ========================================================================
+    // STEP 4: Query DynamoDB for user's items
+    // ========================================================================
+    // Query is more efficient than Scan because we use the partition key
+    const result = await ddb.send(
+      new QueryCommand({
+        TableName: HISTORY_TABLE,
+        
+        // Query by partition key (userId)
+        KeyConditionExpression: "userId = :u",
+        ExpressionAttributeValues: {
+          ":u": { S: userId },
+        },
+        
+        // Sort order: false = descending (newest first)
+        // This sorts by the createdAt sort key
+        ScanIndexForward: false,
+        
+        // Limit number of results
+        Limit: isNaN(limit) ? 20 : limit,
+      })
+    );
+    
+    console.log("Query result count:", result.Items?.length || 0);
+    
+    // ========================================================================
+    // STEP 5: Transform DynamoDB items to frontend-friendly format
+    // ========================================================================
+    const items = (result.Items || []).map((raw) => {
+      // unmarshall converts DynamoDB format to regular JavaScript object
+      // Example: { S: "value" } → "value"
+      const obj = unmarshall(raw);
+      
+      // Create preview of summary (first 240 characters)
+      // This is useful for displaying in a list without loading full summary
+      const summaryPreview =
+        obj.summary && obj.summary.length > 240
+          ? obj.summary.slice(0, 240) + "…"
+          : obj.summary || "";
+      
+      // Return cleaned object
+      return {
+        userId: obj.userId,
+        fileKey: obj.fileKey,
+        createdAt: obj.createdAt,
+        summaryPreview,      // Short preview for list view
+        summary: obj.summary, // Full summary for detail view
+        email: obj.email,
+        originalFileName: obj.originalFileName, // if stored
+      };
+    });
+    
+    console.log("Returning items:", items.length);
+    
+    // ========================================================================
+    // STEP 6: Return response to frontend
+    // ========================================================================
+    return {
+      statusCode: 200,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Credentials": "true",
+      },
+      body: JSON.stringify({ items }),
+    };
+    
+  } catch (err) {
+    console.error("Error in research-history:", err);
+    return {
+      statusCode: 500,
+      headers: { "Access-Control-Allow-Origin": "*" },
+      body: JSON.stringify({ 
+        message: "Internal server error", 
+        error: err.message 
+      }),
+    };
+  }
+};
+
+/**
+ * ============================================================================
+ * HOW DYNAMODB QUERY WORKS:
+ * ============================================================================
+ * 
+ * DynamoDB Query vs Scan:
+ * - Query: Searches by partition key (very fast, efficient)
+ * - Scan: Reads entire table (slow, expensive)
+ * 
+ * In this function:
+ * 1. We query by userId (partition key) - this is efficient
+ * 2. Results are automatically sorted by createdAt (sort key)
+ * 3. ScanIndexForward: false means descending order (newest first)
+ * 4. Limit restricts number of results returned
+ * 
+ * Table Structure:
+ * ┌─────────┬────────────┬────────────────────────────────┐
+ * │ userId  │ createdAt  │ Other Attributes               │
+ * ├─────────┼────────────┼────────────────────────────────┤
+ * │ user123 │ 2025-01-05 │ fileKey, summary, email        │
+ * │ user123 │ 2025-01-04 │ fileKey, summary, email        │
+ * │ user123 │ 2025-01-03 │ fileKey, summary, email        │
+ * └─────────┴────────────┴────────────────────────────────┘
+ * 
+ * ============================================================================
+ * TESTING:
+ * ============================================================================
+ * 
+ * Test event (without query parameters):
+ * {
+ *   "requestContext": {
+ *     "authorizer": {
+ *       "jwt": {
+ *         "claims": {
+ *           "sub": "test-user-123",
+ *           "email": "test@example.com"
+ *         }
+ *       }
+ *     }
+ *   }
+ * }
+ * 
+ * Test event (with limit parameter):
+ * {
+ *   "queryStringParameters": {
+ *     "limit": "10"
+ *   },
+ *   "requestContext": {
+ *     "authorizer": {
+ *       "jwt": {
+ *         "claims": {
+ *           "sub": "test-user-123",
+ *           "email": "test@example.com"
+ *         }
+ *       }
+ *     }
+ *   }
+ * }
+ * 
+ * ============================================================================
+ * EXPECTED RESPONSE:
+ * ============================================================================
+ * 
+ * {
+ *   "statusCode": 200,
+ *   "headers": {
+ *     "Access-Control-Allow-Origin": "*",
+ *     "Access-Control-Allow-Credentials": "true"
+ *   },
+ *   "body": "{\"items\":[{\"userId\":\"user123\",\"fileKey\":\"private/user123/1234-doc.pdf\",\"createdAt\":\"2025-01-05T10:30:00Z\",\"summaryPreview\":\"This document discusses...\",\"summary\":\"Full summary text here\",\"email\":\"user@example.com\"}]}"
+ * }
+ * 
+ * ============================================================================
+ * TROUBLESHOOTING:
+ * ============================================================================
+ * 
+ * - "HISTORY_TABLE not set": Add environment variable
+ * - "Access denied to DynamoDB": Check Lambda role has dynamodb:Query
+ * - "No items returned": Check if user has uploaded any documents
+ * - "401 Unauthorized": Check JWT authorizer is configured correctly
+ * 
+ * ============================================================================
+ */
