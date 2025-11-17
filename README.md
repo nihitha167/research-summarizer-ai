@@ -4,9 +4,7 @@ A serverless web application where users log in, upload research documents (PDF 
 
 This README describes the entire project – frontend and backend – and explains how to recreate all AWS resources without exposing any personal credentials.
 
-======================================================================
 1. HIGH-LEVEL ARCHITECTURE
-======================================================================
 
 Frontend
 - React + Vite single-page app
@@ -41,9 +39,7 @@ Simple data flow:
 6) Frontend loads past summaries using GET /history.
 7) User can delete items via DELETE /item/{fileKey+}, which removes from DynamoDB and S3.
 
-======================================================================
 2. REPOSITORY STRUCTURE
-======================================================================
 
 Top-level layout (recommended):
 
@@ -64,9 +60,7 @@ project-root/
 - backend/ contains code for all Lambda functions (one file per function).
 - frontend/ contains the React app that talks to API Gateway.
 
-======================================================================
 3. PREREQUISITES
-======================================================================
 
 - AWS account with access to:
   - Cognito
@@ -79,9 +73,7 @@ project-root/
 - Node.js and npm installed locally
 - Git and a GitHub (or other Git provider) repository
 
-======================================================================
 4. FRONTEND SETUP (LOCAL)
-======================================================================
 
 1) Clone the repository locally.
 
@@ -97,9 +89,7 @@ project-root/
 
 You will finish Cognito and API Gateway setup first, then come back to configure the frontend environment variables.
 
-======================================================================
 5. AWS SETUP – STEP BY STEP
-======================================================================
 
 The order that works best:
 
@@ -113,9 +103,7 @@ The order that works best:
 8) Configure CORS and test APIs.
 9) Configure and deploy Amplify Hosting for the frontend.
 
---------------------------------------------------
 5.1. Amazon Cognito – User Pool and Hosted UI
---------------------------------------------------
 
 Goal: issue JWTs that your frontend passes to API Gateway as Authorization: Bearer <token>.
 
@@ -141,9 +129,7 @@ Steps:
 
 You will use these values later in the frontend configuration and Amplify Authenticator.
 
---------------------------------------------------
 5.2. S3 Bucket for Uploads
---------------------------------------------------
 
 Goal: store original documents safely, using a structure like:
 private/{userId}/{timestamp}-{filename}
@@ -165,9 +151,7 @@ Steps:
 
 Note the bucket name; this will be used as the UPLOAD_BUCKET environment variable in Lambdas.
 
---------------------------------------------------
 5.3. DynamoDB Table for History
---------------------------------------------------
 
 Goal: store summaries per user, sorted by time.
 
@@ -189,9 +173,7 @@ Goal: store summaries per user, sorted by time.
 
 Note the table name; used as HISTORY_TABLE environment variable in Lambdas.
 
---------------------------------------------------
 5.4. IAM – Roles and Permissions for Lambda
---------------------------------------------------
 
 You can either use one shared execution role for all four functions, or separate roles for each. Here is what the role needs:
 
@@ -223,9 +205,7 @@ Scope all these permissions to:
 
 Attach this IAM role as the “Execution role” to each Lambda function you create.
 
---------------------------------------------------
 5.5. Amazon Bedrock – Model Access
---------------------------------------------------
 
 1) In the AWS console, open Amazon Bedrock.
 2) Under “Model access”, request access for:
@@ -235,9 +215,7 @@ Attach this IAM role as the “Execution role” to each Lambda function you cre
 
 You will use this in the research-summarize Lambda.
 
---------------------------------------------------
 5.6. Lambda Functions – Backend Files
---------------------------------------------------
 
 You have four backend files:
 
@@ -273,9 +251,7 @@ Additional for research-summarize:
 
 After you create the functions in the console (or via CLI), upload the corresponding backend/*.mjs file as the function code for each.
 
---------------------------------------------------
 5.7. API Gateway – HTTP API, Routes, Integrations, Auth
---------------------------------------------------
 
 Goal: create a single HTTP API with JWT auth that forwards to the four Lambdas.
 
@@ -334,9 +310,7 @@ Goal: create a single HTTP API with JWT auth that forwards to the four Lambdas.
 7) Test via console:
    - Use “Test” in API Gateway or send HTTP requests with a sample JWT token (from a test login) to verify each route.
 
-======================================================================
 6. FRONTEND INTEGRATION WITH BACKEND
-======================================================================
 
 You must connect three things in the React app:
 
@@ -344,9 +318,7 @@ You must connect three things in the React app:
 2) API Gateway base URL
 3) Region or any other constants you need
 
---------------------------------------------------
 6.1. Frontend Environment Variables
---------------------------------------------------
 
 In the frontend project, create a .env file for local development (do not commit secrets):
 
@@ -364,9 +336,7 @@ How you configure this depends on whether you use “Amplify configure” or man
 - Have a config file (for example src/awsConfig.js) that initializes Amplify’s Auth with your Cognito values.
 - The Authenticator component from @aws-amplify/ui-react uses this configuration under the hood.
 
---------------------------------------------------
 6.2. React App Behavior
---------------------------------------------------
 
 Main responsibilities of the React app:
 
@@ -390,9 +360,7 @@ Main responsibilities of the React app:
   - On click: show full summary.
   - On delete: calls DELETE /item/{fileKey+} with Authorization header and removes the item from local state if successful.
 
-======================================================================
 7. AMPLIFY HOSTING
-======================================================================
 
 Goal: deploy the frontend using AWS Amplify CI/CD while keeping Lambdas and infrastructure managed separately.
 
@@ -417,9 +385,7 @@ Amplify will:
 - Run npm install and npm run build inside frontend/
 - Serve the built app from frontend/dist.
 
-======================================================================
 8. TESTING END-TO-END
-======================================================================
 
 1) Create a test user in Cognito and confirm them (or allow self-sign-up).
 2) Log in via:
@@ -440,9 +406,7 @@ Also verify in AWS:
 - DynamoDB: new item appears for that userId and createdAt.
 - CloudWatch Logs: Lambdas run successfully.
 
-======================================================================
 9. SECURITY AND BEST PRACTICES
-======================================================================
 
 - Never hard-code secrets or AWS account IDs in the frontend.
 - Keep all privileged values in AWS (IAM, environment variables, secret managers) and only expose what is safe (API base URL, region, etc.).
@@ -453,9 +417,7 @@ Also verify in AWS:
 - Limit file size (this app uses 4.5 MB) to avoid Bedrock or Lambda limits and reduce cost.
 - Ensure CORS is locked down to the actual origins you use rather than wildcard (*) in production.
 
-======================================================================
 10. TROUBLESHOOTING NOTES
-======================================================================
 
 Common issues and where to look:
 
@@ -478,9 +440,7 @@ Common issues and where to look:
    - Ensure the route uses path parameter {fileKey+} so the whole key including slashes is captured.
    - Check that the fileKey in DynamoDB exactly matches what the frontend is sending.
 
-======================================================================
 11. HOW TO REUSE OR EXTEND THE PROJECT
-======================================================================
 
 Ideas for future enhancements:
 - Add per-user tags or categories for summaries.
@@ -489,12 +449,7 @@ Ideas for future enhancements:
 - Support multiple summarization styles (bullet points, abstract, executive summary) by sending different prompts to Bedrock.
 - Add support for OCR for scanned PDFs by piping through Amazon Textract before summarization.
 
-======================================================================
 12. QUICK STORY (SHORT VERSION)
-======================================================================
 
 “I built a serverless Research Summarizer on AWS. The frontend is a React app hosted with Amplify and protected by Cognito. Users upload research PDFs or text documents, which are stored in a private S3 bucket via presigned URLs. A Lambda function reads the document from S3 and calls Amazon Bedrock (Claude) to generate summaries. Another Lambda stores and retrieves summaries from a DynamoDB table and exposes history and delete endpoints via API Gateway. Everything is wired with JWT-based authorization, least-privilege IAM roles, and CORS so both local dev and production (Amplify) work cleanly.”
 
-======================================================================
-END OF README
-======================================================================
